@@ -1,0 +1,138 @@
+
+import { Server } from "socket.io";
+import jwt from "jsonwebtoken";
+import prisma from "../lib/prisma.js";
+
+// userId -> набір активних socket-з'єднань
+const onlineUsers = new Map();
+
+export function initSocket(server) {
+  const io = new Server(server, {
+    cors: {
+      origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(",").map((v) => v.trim()) : (process.env.CLIENT_URL || "http://localhost:5173"),
+      methods: ["GET", "POST"],
+    },
+  });
+
+  // JWT-авторизація Socket.IO
+  io.use((socket, next) => {
+    const token = socket.handshake.auth?.token;
+
+    if (!token) {
+      return next(new Error("Потрібна автентифікація"));
+    }
+
+    try {
+      const payload = jwt.verify(token, process.env.JWT_SECRET);
+
+      if (!payload.sub) {
+        return next(new Error("Токен не містить ID користувача"));
+      }
+
+      socket.user = {
+        id: String(payload.sub),
+        role: payload.role,
+      };
+
+      next();
+    } catch {
+      next(new Error("Недійсний або прострочений токен"));
+    }
+  });
+
+  io.on("connection", (socket) => {
+    const userId = socket.user.id;
+
+    // Персональна кімната користувача
+    socket.join(`user:${userId}`);
+
+    let userSockets = onlineUsers.get(userId);
+
+    if (!userSockets) {
+      userSockets = new Set();
+      onlineUsers.set(userId, userSockets);
+    }
+
+    const wasOffline = userSockets.size === 0;
+    userSockets.add(socket.id);
+
+    // Передаємо список користувачів онлайн
+    socket.emit("presence:list", {
+      onlineUserIds: [...onlineUsers.keys()],
+    });
+
+    if (wasOffline) {
+      io.emit("presence:update", {
+        userId,
+        status: "online",
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    socket.emit("connected", {
+      message: "З'єднання встановлено",
+      userId,
+    });
+
+    // Запит актуального списку користувачів онлайн
+    socket.on("presence:get", () => {
+      socket.emit("presence:list", {
+        onlineUserIds: [...onlineUsers.keys()],
+      });
+    });
+
+    // Приєднання до кімнати події з перевіркою прав організатора.
+    socket.on("event:join", async (eventId) => {
+      try {
+        const id = Number(eventId);
+        if (!Number.isInteger(id) || id <= 0) {
+          socket.emit("socket:error", { message: "Некоректний ID події" });
+          return;
+        }
+        const where = socket.user.role === "ADMIN" ? { id } : { id, organizerId: Number(userId) };
+        const event = await prisma.event.findFirst({ where, select: { id: true } });
+        if (!event) {
+          socket.emit("socket:error", { message: "Подію не знайдено або немає доступу" });
+          return;
+        }
+        await socket.join(`event:${id}`);
+        socket.emit("event:joined", { eventId: id });
+      } catch (error) {
+        console.error("Помилка event:join:", error);
+        socket.emit("socket:error", { message: "Не вдалося приєднатися до кімнати події" });
+      }
+    });
+
+    socket.on("event:leave", async (eventId) => {
+      const id = Number(eventId);
+      if (!Number.isInteger(id) || id <= 0) return;
+      await socket.leave(`event:${id}`);
+      socket.emit("event:left", { eventId: id });
+    });
+
+    // Обробка відключення користувача
+    socket.on("disconnect", () => {
+      const sockets = onlineUsers.get(userId);
+
+      if (!sockets) {
+        return;
+      }
+
+      // Видаляємо конкретне відключене з'єднання
+      sockets.delete(socket.id);
+
+      // Користувач стає offline, якщо активних з'єднань більше немає
+      if (sockets.size === 0) {
+        onlineUsers.delete(userId);
+
+        io.emit("presence:update", {
+          userId,
+          status: "offline",
+          timestamp: new Date().toISOString(),
+        });
+      }
+    });
+  });
+
+  return io;
+}
